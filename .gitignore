@@ -1,0 +1,6 @@
+data/*
+!data/cpi_raw.csv
+deck/
+__pycache__/
+.DS_Store
+*.pyc
