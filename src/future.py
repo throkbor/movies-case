@@ -2,10 +2,10 @@
 import numpy as np
 import pandas as pd
 
-from backtest import BUDGET, profit_and_risk
+from backtest import BUDGET, PRED_COLS, profit_and_risk
 from model import BASICS, CAST, TRACK, tune_and_fit
 
-PENALTY = 0.25  # how many dollars of expected profit i'd give up to cut $1 of slate std dev
+PENALTY = 0.25  # the risk penalty i went with (see RISK_PENALTIES in backtest.py)
 LAST_YEAR = 2016
 
 # name, budget, month, sequel, genres, flags, track record
@@ -39,18 +39,16 @@ PROFILES = [
     ("Teen comedy", 15e6, 8, 0, ["comedy"], [], "typical"),
     ("Low-budget sci-fi", 10e6, 4, 0, ["science_fiction", "thriller"], [], "newcomer"),
     ("Micro-budget horror", 4e6, 1, 0, ["horror"], [], "newcomer"),
-    ("Documentary", 3e6, 6, 0, ["documentary"], [], "newcomer"),
+    ("Documentary", 4e6, 6, 0, ["documentary"], [], "newcomer"),
 ]
 LEVELS = {"strong": 0.75, "typical": 0.5, "newcomer": 0.25}
 
 
 def track_record(recent, who, level):
     # a made-up film's director / cast / studio / franchise record = that percentile of recent films that had one
-    stats = {}
     with_history = recent[recent[f"{who}_n_prior"] > 0]
-    for col in [c for c in TRACK if c.startswith(who + "_")]:
-        stats[col] = 0 if col.endswith("no_history") else with_history[col].quantile(LEVELS[level])
-    return stats
+    return {c: 0 if c.endswith("no_history") else with_history[c].quantile(LEVELS[level])
+            for c in TRACK if c.startswith(who + "_")}
 
 
 def no_history(who):
@@ -79,14 +77,13 @@ def make_profiles(d, genres):
 
 
 def best_slate(profiles, penalty):
-    # checks every combo that fits in $300M, and skips a branch once it can't beat the best combo so far.
-    # films are independent, so a slate's variance is just the sum of its films' variances
+    # checks every full combo that fits in $300M, and skips a branch once it can't beat the best combo so far
     films = profiles.assign(ratio=profiles["exp_profit"] / profiles["budget_real"]).sort_values("ratio", ascending=False)
     budget, profit, var = films["budget_real"].values, films["exp_profit"].values, films["sd_profit"].values ** 2
     best = {"score": -np.inf, "picked": []}
 
     def most_extra_profit(i, room):
-        # the most profit the remaining films could add if you could buy fractions of them (so it's never too low)
+        # the most profit the remaining films could add if you could buy fractions of them, so it's never too low
         extra = 0
         for j in range(i, len(films)):
             if profit[j] <= 0 or room <= 0:
@@ -98,7 +95,10 @@ def best_slate(profiles, penalty):
 
     def search(i, spent, total_profit, total_var, picked):
         score = total_profit - penalty * np.sqrt(total_var)
-        if score > best["score"]:
+        # same rule as the backtest: the $300M gets spent, so a slate only counts once nothing else fits
+        rest = np.delete(budget, picked)
+        full = rest.size == 0 or rest.min() > BUDGET - spent
+        if full and score > best["score"]:
             best["score"], best["picked"] = score, picked
         if i == len(films):
             return
@@ -121,14 +121,13 @@ def main():
     profiles = make_profiles(d, genres)
 
     # same three models as the walk-forward, but trained on everything up to 2016
-    for bar, col in [(1, "pred"), (2.5, "pred_2.5x"), (5, "pred_5x")]:
+    for bar, col in PRED_COLS.items():
         model = tune_and_fit(d[features], (d["roi"] > bar).astype(int))
         profiles[col] = model.predict_proba(profiles[features])[:, 1]
 
-    profiles = profit_and_risk(profiles, d["roi"])
+    profiles = profit_and_risk(profiles, d)
     slate = best_slate(profiles, PENALTY)
     profiles["funded"] = profiles.index.isin(slate.index)
-    profiles["exp_multiple"] = 1 + profiles["exp_profit"] / profiles["budget_real"]
 
     cols = ["name", "budget_real", "pred", "pred_2.5x", "pred_5x", "exp_multiple", "exp_profit", "sd_profit", "funded"]
     print(profiles[cols].sort_values("exp_multiple", ascending=False).round(2).to_string())

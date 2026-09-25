@@ -6,39 +6,46 @@ import pandas as pd
 BUDGET = 300e6  # 2017 dollars
 N_RANDOM = 1000
 BIG = 100e6  # "blockbuster" = budget of $100M or more
-CAP = 50  # a few films made 100x+. for averages and spreads, anything over 50x counts as 50x
-RISK_PENALTIES = [0, 0.25, 0.5, 1]  # how many dollars of expected profit i'd give up to cut $1 of slate std dev
-PRED_COLS = {1: "pred", 2.5: "pred_2.5x", 5: "pred_5x"}  # which model's prediction goes with which bar
+CAP = 50  # a few films made 100x+, so for averages and spreads anything over 50x counts as 50x
+RISK_PENALTIES = [0, 0.25, 0.75, 1, 1.5]  # how many dollars of expected profit i'd give up to cut $1 of slate std dev
+PRED_COLS = {1: "pred", 2.5: "pred_2.5x", 5: "pred_5x"}
 
 
-def profit_and_risk(films, train_roi, bars=(1, 2.5, 5)):
-    # the models give each film a chance of landing in each band. with all three: under 1x, 1-2.5x, 2.5-5x, 5x+.
-    # with just the 1x model it's only two bands: under 1x and over 1x.
-    # the average and spread of each band come from the training years
-    bands = pd.cut(train_roi, [0, *bars, np.inf])
-    capped = train_roi.clip(upper=CAP)
-    band_mean, band_sq = capped.groupby(bands).mean().values, (capped ** 2).groupby(bands).mean().values
+def band_averages(train, bars=(1, 2.5, 5)):
+    # average (and average squared) return in each band, from the training years.
+    # split into budget thirds so a blockbuster that clears 5x is compared with other blockbusters, not tiny breakout hits
+    edges = train["budget_real"].quantile([1 / 3, 2 / 3]).values
+    group = np.searchsorted(edges, train["budget_real"])
+    band = pd.cut(train["roi"], [0, *bars, np.inf], labels=False).values
+    capped = train["roi"].clip(upper=CAP)
+    mean = capped.groupby([group, band]).mean().unstack().values
+    sq = (capped ** 2).groupby([group, band]).mean().unstack().values
+    return edges, mean, sq
 
-    # chance of clearing each bar -> chance of landing between each pair of bars
+
+def profit_and_risk(films, train, bars=(1, 2.5, 5)):
+    # each film gets a chance of landing in each band: under 1x, 1-2.5x, 2.5-5x, 5x+
+    edges, mean, sq = band_averages(train, bars)
+    group = np.searchsorted(edges, films["budget_real"])
+    band_mean, band_sq = mean[group], sq[group]
+
     clear = np.column_stack([np.ones(len(films))] + [films[PRED_COLS[b]] for b in bars] + [np.zeros(len(films))])
     chances = (clear[:, :-1] - clear[:, 1:]).clip(0)
     chances = chances / chances.sum(axis=1, keepdims=True)
 
-    mean_multiple = chances @ band_mean
-    sd_multiple = np.sqrt(chances @ band_sq - mean_multiple ** 2)
-    films = films.copy()
-    films["exp_profit"] = films["budget_real"] * (mean_multiple - 1)
-    films["sd_profit"] = films["budget_real"] * sd_multiple
-    films["exp_multiple"] = mean_multiple
-    return films
+    mean_multiple = (chances * band_mean).sum(axis=1)
+    sd_multiple = np.sqrt((chances * band_sq).sum(axis=1) - mean_multiple ** 2)
+    return films.assign(exp_profit=films["budget_real"] * (mean_multiple - 1),
+                        sd_profit=films["budget_real"] * sd_multiple,
+                        exp_multiple=mean_multiple)
 
 
 def risk_adjusted_slate(films, penalty):
     # keep adding whichever film raises (expected profit - penalty * slate std dev) the most per dollar.
-    # this is a shortcut, not the exact best slate (too many films to check every combo), so the backtest is approximate
-    # films are treated as independent, so the slate's variance is just the sum of the films' variances
+    # it's a shortcut, not the exact best slate: too many films to check every combo.
+    # films are treated as independent, so the slate's variance is just the sum of theirs
     spent, profit, variance, picked = 0, 0, 0, []
-    left = films.copy()
+    left = films
     while True:
         left = left[left["budget_real"] <= BUDGET - spent]
         if left.empty:
@@ -56,7 +63,6 @@ def risk_adjusted_slate(films, penalty):
 
 
 def fill_slate(films):
-    # go down the list and take every film that still fits in the budget
     spent, picked = 0, []
     for i, budget in films["budget_real"].items():
         if spent + budget <= BUDGET:
@@ -83,12 +89,12 @@ def main():
     rows, picks, scored = [], [], []
 
     for block, films in p.groupby("block"):
-        train_roi = d.loc[d["year"] < block, "roi"]
-        one = profit_and_risk(films, train_roi, bars=(1,))
-        films = profit_and_risk(films, train_roi)
+        train = d[d["year"] < block]
+        one = profit_and_risk(films, train, bars=(1,))
+        films = profit_and_risk(films, train)
         scored.append(films.assign(exp_multiple_1x=one["exp_multiple"]))
 
-        # does adding the 2.5x and 5x models pick better films than the 1x model alone? same penalty, same rule
+        # do the 2.5x and 5x models pick better films than the 1x model alone? same penalty, same rule
         rows.append({"block": block, "strategy": "1x_model_only", "draw": 0, **result(risk_adjusted_slate(one, 0.25))})
         for penalty in RISK_PENALTIES:
             slate = risk_adjusted_slate(films, penalty)
@@ -96,7 +102,6 @@ def main():
                          "predicted_sd": np.sqrt((slate["sd_profit"] ** 2).sum())})
             picks.append(slate.assign(block=block, penalty=penalty))
 
-        # random picks and random blockbuster picks, many times, to get a range
         big = films[films["budget_real"] >= BIG]
         for draw in range(N_RANDOM):
             rows.append({"block": block, "strategy": "random", "draw": draw,
@@ -110,13 +115,11 @@ def main():
     print("revenue / budget of the $300M slate, median over draws:\n"
           + per_block["multiple"].unstack(0).round(2).to_string())
 
-    # how each strategy did across the 9 blocks: average, how much it swung, and the worst block
     summary = per_block.groupby("strategy").agg(
         avg_multiple=("multiple", "mean"), sd_multiple=("multiple", "std"), worst_multiple=("multiple", "min"),
         avg_films=("n_films", "mean"))
     print("\nacross blocks:\n" + summary.round(2).to_string())
 
-    # how well each version's expected multiple lines up with what films actually made (rank correlation)
     scored = pd.concat(scored)
     for col, name in [("exp_multiple_1x", "1x model only"), ("exp_multiple", "all three models")]:
         print(f"rank correlation with actual return, {name}: {scored[col].corr(scored['roi'], method='spearman'):.3f}")

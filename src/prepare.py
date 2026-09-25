@@ -1,5 +1,6 @@
-# turns movies_metadata.csv + credits.csv into one clean table for the model
+# turns movies_metadata.csv + credits.csv + keywords.csv into one clean table for the model
 import ast
+import os
 
 import numpy as np
 import pandas as pd
@@ -7,7 +8,7 @@ import pandas as pd
 BASE_YEAR = 2017  # all dollars get converted to 2017 dollars
 MIN_DOLLARS = 10_000  # budgets or revenues under this are basically always unit errors
 MIN_YEAR = 1970
-MIN_BUDGET = 1e6  # 2017 dollars. films under $1M are too small to matter for a $300M studio
+MIN_BUDGET = 4e6  # 2017 dollars. films under $4M are too small to matter for a $300M studio
 
 
 def parse(text):
@@ -31,16 +32,16 @@ def load_movies():
     m["year"] = m["release_date"].dt.year
     m["month"] = m["release_date"].dt.month
 
+    # foreign films with revenue under 1% of budget: the revenue is probably just the us box office
+    us_only_revenue = (m["original_language"] != "en") & (m["revenue"] < 0.01 * m["budget"])
     keep = (
         (m["status"] == "Released")
         & (m["budget"] >= MIN_DOLLARS)
         & (m["revenue"] >= MIN_DOLLARS)
         & (m["year"] >= MIN_YEAR)
         & m["runtime"].between(40, 300)  # a runtime of 0 is really just missing
+        & ~us_only_revenue
     )
-    # foreign films where revenue is under 1% of budget. the revenue is probably just the us box office
-    us_only_revenue = (m["original_language"] != "en") & (m["revenue"] < 0.01 * m["budget"])
-    keep = keep & ~us_only_revenue
     return m[keep].copy()
 
 
@@ -63,8 +64,8 @@ def add_metadata(d):
     d["companies"] = d["production_companies"].apply(names)
     d["countries"] = d["production_countries"].apply(names)
 
-    # tmdb adds collections after the fact, so this can't be used as "is a franchise film" on its own.
-    # the first star wars is in a collection too. is_sequel gets made from it later, looking only backward
+    # tmdb adds collections after the fact (the first star wars is in one), so this isn't "is a franchise film"
+    # on its own. is_sequel gets made from it later, looking only backward
     d["collection"] = d["belongs_to_collection"].apply(lambda x: [parse(x)["name"]] if isinstance(x, str) else [])
     d["is_english"] = (d["original_language"] == "en").astype(int)
     d["is_us"] = d["countries"].apply(lambda c: "United States of America" in c).astype(int)
@@ -89,7 +90,7 @@ def add_credits(d):
     cr["top_cast"] = billed.str[:3]
     cr["top5_cast"] = billed.str[:5]  # only for a comparison run against top 3
     cr["directors"] = crew.apply(lambda c: [p["name"] for p in c if p["job"] == "Director"])
-    # no cast or crew size: tmdb fills in credits more for popular films, so those counts sneak popularity in
+    # no cast or crew size on purpose: tmdb fills in credits more for popular films, so those counts sneak popularity in
 
     d = d.merge(cr[["id", "top_cast", "top5_cast", "directors"]], on="id", how="left")
     for col in ["top_cast", "top5_cast", "directors"]:
@@ -115,18 +116,16 @@ def add_keywords(d):
 
 
 def add_track_record(d, col, prefix):
-    # for each film, look at how its directors / cast / studios / franchise did on films that came out before it.
-    # it only ever looks backward, so nothing from the future leaks in
+    # how a film's directors / cast / studios / franchise did on films released before it.
+    # it only looks backward so nothing from the future leaks into the model
     d = d.sort_values("release_date").reset_index(drop=True)
     past = {}  # name -> {film id: (profitable, revenue, roi)} for their films so far
     stats, rows = [], []
 
-    # films that come out the same day go together: work out all their stats first, then add them to past,
-    # so two same-day films can't see each other's results
+    # same-day films get their stats first and only then go into past, so they can't see each other's results
     for _, day in d.groupby("release_date"):
         for i, film in day.iterrows():
-            # merging the dicts means a film two of them were in only counts once
-            prior = {}
+            prior = {}  # merging the dicts means a film two of them were in only counts once
             for person in film[col]:
                 prior.update(past.get(person, {}))
 
@@ -166,6 +165,7 @@ def main():
         d[col] = d[col].str.join("|")
     raw_cols = ["production_companies", "production_countries", "spoken_languages", "belongs_to_collection",
                 "overview", "tagline", "poster_path", "homepage", "video", "adult"]
+    os.makedirs("data/processed", exist_ok=True)
     d.drop(columns=raw_cols).to_csv("data/processed/movies_clean.csv", index=False)
 
     print(f"{len(d)} films, {d.year.min():.0f}-{d.year.max():.0f}")

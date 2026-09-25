@@ -8,7 +8,7 @@ Download the dataset from Kaggle and unzip the CSVs into `data/raw/`. `data/cpi_
 
 ## Run
 
-From the repo root:
+Needs Python 3.10 or 3.11. From the repo root:
 
 ```
 pip install -r requirements.txt
@@ -18,4 +18,4 @@ python src/backtest.py   # $300M slates picked by the model vs random and blockb
 python src/future.py     # 30 made-up films for next year, and which ones the model funds
 ```
 
-Then run `notebooks/eda.ipynb` and `notebooks/model_charts.ipynb`. All charts save to `figures/`.
+The whole pipeline takes about 3 minutes on a laptop. Then run `notebooks/eda.ipynb` and `notebooks/model_charts.ipynb`. All charts save to `figures/`.

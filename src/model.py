@@ -17,7 +17,7 @@ BASICS = [
 TRACK_STATS = ["n_prior", "hit_rate", "median_revenue", "mean_revenue", "median_roi", "mean_roi", "no_history"]
 TRACK = [f"{who}_{stat}" for who in ["dir", CAST, "studio", "franchise"] for stat in TRACK_STATS]
 
-# the main model is "did it make its budget back". the 2.5x and 5x ones are only there to say how big the win is
+# the main model is "did it make its budget back". the 2.5x and 5x ones just say how big the win is
 BARS = [1, 2.5, 5]
 
 SEARCH_SPACE = {
@@ -32,7 +32,6 @@ SEARCH_SPACE = {
 
 
 def score(y, p, baseline):
-    # baseline is what you'd guess from the training years alone: their most common class
     return {
         "roc_auc": roc_auc_score(y, p),
         "pr_auc_flop": average_precision_score(1 - y, 1 - p),  # how well it picks out the flops
@@ -43,26 +42,17 @@ def score(y, p, baseline):
 
 
 def tune_and_fit(X, y):
-    # the tuning cv is time-ordered too, so it never trains on later films than it tests on
+    # the tuning cv is time-ordered too, so it never trains on films later than the ones it tests on
     search = RandomizedSearchCV(
         xgb.XGBClassifier(eval_metric="logloss", random_state=0),
         SEARCH_SPACE, n_iter=30, scoring="roc_auc",
         cv=TimeSeriesSplit(n_splits=3), random_state=0, n_jobs=-1,
     )
-    search.fit(X, y)
-    return search
-
-
-def expected_multiple(p1, p2_5, p5, train_roi):
-    # the three models make a ladder: chance of landing under 1x, 1-2.5x, 2.5-5x, or 5x+.
-    # each chance times the typical return in that band (training years only) = expected revenue / budget
-    chances = [1 - p1, (p1 - p2_5).clip(0), (p2_5 - p5).clip(0), p5]
-    band_medians = train_roi.groupby(pd.cut(train_roi, [0, 1, 2.5, 5, np.inf])).median()
-    return sum(c * m for c, m in zip(chances, band_medians))
+    return search.fit(X, y)
 
 
 def shap_values(model, X):
-    # xgboost works out shap values itself. the last column it returns is the baseline, so it gets dropped
+    # the last column xgboost returns is the baseline, not a feature
     contribs = model.get_booster().predict(xgb.DMatrix(X), pred_contribs=True)
     return pd.DataFrame(contribs[:, :-1], columns=X.columns, index=X.index)
 
@@ -91,14 +81,11 @@ def main():
         folds.append({"years": years, "n_train": train.sum(), "n_test": test.sum(),
                       **score(y[test], d.loc[test, "pred"], d.loc[test, "baseline"]), "params": search.best_params_})
 
-        # same setup, just a higher bar
         for bar in BARS[1:]:
             y_bar = (d["roi"] > bar).astype(int)
             d.loc[test, f"pred_{bar}x"] = tune_and_fit(X[train], y_bar[train]).predict_proba(X[test])[:, 1]
             folds[-1][f"roc_auc_{bar}x"] = roc_auc_score(y_bar[test], d.loc[test, f"pred_{bar}x"])
 
-        d.loc[test, "expected_multiple"] = expected_multiple(
-            d.loc[test, "pred"], d.loc[test, "pred_2.5x"], d.loc[test, "pred_5x"], d.loc[train, "roi"])
         print(f"{years}: auc {folds[-1]['roc_auc']:.3f} (2.5x {folds[-1]['roc_auc_2.5x']:.3f}, "
               f"5x {folds[-1]['roc_auc_5x']:.3f}) on {test.sum()} films")
 
